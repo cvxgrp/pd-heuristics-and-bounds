@@ -1,11 +1,9 @@
-using JuMP, Ipopt, OSQP, MosekTools
-using Evolutionary
-using LinearAlgebra, SparseArrays
-using Random
+Random.seed!(1234)
 
 function ipopt_optimize(A, b, w, z_hat)
     @info "IPOPT"
     model = Model(Ipopt.Optimizer)
+    MOI.set(model, MOI.Silent(), true)
 
     n = size(A, 1)
 
@@ -18,10 +16,10 @@ function ipopt_optimize(A, b, w, z_hat)
         @NLconstraint(model, sum(v * z[j] for (j, v) in zip(findnz(A[i, :])...)) + θ[i]*z[i] == b[i])
     end
 
-    @time optimize!(model)
+    optimize!(model)
     @info "Objective value (IPOPT): $(objective_value(model))"
 
-    return JuMP.value.(θ), JuMP.value.(z)
+    return objective_value(model)
 end
 
 function greedy_round_robin(A, b, w, z_hat; max_iter=1000)
@@ -49,7 +47,6 @@ function greedy_round_robin(A, b, w, z_hat; max_iter=1000)
             θ_curr[idx] *= -1
         else
             old_obj = curr_obj
-            @info "New smaller objective found: $(curr_obj)"
         end
     end
 
@@ -57,20 +54,21 @@ function greedy_round_robin(A, b, w, z_hat; max_iter=1000)
 
     @info "Objective value (Greedy): $(old_obj)"
 
-    return θ_curr, z_curr
+    return old_obj
 end
 
-function sign_flip_descent(A, b, w, z_hat; max_iter=20, tol=1e-4)
+function sign_flip_descent(A, b, w, z_hat; max_iter=100, tol=1e-5)
     @info "Sign flip descent"
     n = size(A, 1)
 
-    s_curr = sign.((A + I) \ b)
+    # Initialize to signs of desired field
+    s_curr = sign.(z_hat)
     s_curr[s_curr .== 0] .= 1
     z_curr = zeros(n)
 
     old_obj = Inf
 
-    @time for curr_iter=1:max_iter
+    for curr_iter=1:max_iter
         model = Model(Mosek.Optimizer)
         MOI.set(model, MOI.Silent(), true)
         @variable(model, z[1:n])
@@ -82,16 +80,14 @@ function sign_flip_descent(A, b, w, z_hat; max_iter=20, tol=1e-4)
             @constraint(model, A[i, :]'*z - b[i] >= -s_curr[i]*z[i])
         end
 
-        @time optimize!(model)
+        optimize!(model)
 
         z_curr .= JuMP.value.(z)
 
         s_curr[abs.(z_curr) .<= tol] .*= -1 # Flip all small signs
 
-        @info "Objective value: $(objective_value(model))"
-
-        if old_obj - objective_value(model) <= 1e-2
-            @info "Tolerance reached at iteration $(curr_iter), exiting"
+        if old_obj - objective_value(model) <= 1e-5
+            @info "Objective value (SFD): $(objective_value(model)) at iteration $curr_iter"
             break
         end
 
@@ -99,21 +95,76 @@ function sign_flip_descent(A, b, w, z_hat; max_iter=20, tol=1e-4)
 
     end
 
-    return z_curr
+    return old_obj
 end
 
 function genetic_algorithm(A, b, w, z_hat)
+    @info "Genetic algorithm"
+    A_fac = ldlt(A)
     function obj_fun(θ)
         if any(abs.(θ) .> 1)
             return Inf
         end
-        z = (A + sparse(Diagonal(θ))) \ b
-        return norm(w .* (z - z_hat))^2
+        ldlt!(A_fac, A + sparse(Diagonal(2*θ .- 1)))
+
+        return norm(w .* (A_fac\b - z_hat))^2
+    end
+
+    n = size(A, 1)
+
+    init_point = rand(n)
+
+    function flip_0_1(recombinant; prob=.05)
+        for i=1:length(recombinant)
+            if rand() < prob
+                recombinant[i] = rand() > .5 ? 0 : 1
+            end
+        end
     end
     
+    result = Evolutionary.optimize(
+        obj_fun,
+        init_point,
+        GA(
+            selection=rouletteinv,
+            mutation=flip_0_1,
+            crossover=line(),
+            mutationRate=0.1,
+            crossoverRate=0.5,
+            ɛ=0.1,
+            populationSize=250
+        )
+    )
 
+    @info "Objective value (GA): $(Evolutionary.minimum(result))"
+
+    return Evolutionary.minimum(result)
 end
 
 function global_solver(A, b, w, z_hat)
-    # TODO
+    @info "Mosek, Global solution"
+    model = Model(Mosek.Optimizer)
+
+    n = size(A, 1)
+
+    @variable(model, y_plus[1:n])
+    @variable(model, y_minus[1:n])
+    @variable(model, s[1:n], Bin)
+
+    z = y_plus + y_minus
+    y = y_plus - y_minus
+
+    @objective(model, Min, sum(
+            w[i]^2*(quad_over_lin(model, y_plus[i], s[i]) + quad_over_lin(model, y_minus[i], 1-s[i])
+            - 2*z[i]*z_hat[i] 
+            + z_hat[i]^2) for i in 1:n
+        )
+    )
+    
+    @constraint(model, A*z + y .== b)
+
+    optimize!(model)
+    @info "Objective value (Global): $(objective_value(model))"
+
+    return objective_value(model)
 end
