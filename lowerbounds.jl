@@ -123,12 +123,19 @@ function diagonal_design_lower_bound(A, b, w, z_hat)
 
     @objective(model, Max, -sum(t) - 2*(ν' * b) + norm(w .* z_hat)^2)
     
+    Atν = A' * ν
+
     for i=1:n
-        quad_over_lin(model, t[i], A[:,i]' * ν - ν[i] - w[i]^2*z_hat[i], w[i]^2)
-        quad_over_lin(model, t[i], A[:,i]' * ν + ν[i] - w[i]^2*z_hat[i], w[i]^2)
+        quad_over_lin(model, t[i], Atν[i] - ν[i] - w[i]^2*z_hat[i], w[i]^2)
+        quad_over_lin(model, t[i], Atν[i] + ν[i] - w[i]^2*z_hat[i], w[i]^2)
     end
 
+    @info "Finished building model"
+
     optimize!(model)
+
+    @info primal_status(model)
+    @info dual_status(model)
 
     @show objective_value(model)
 end

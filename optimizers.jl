@@ -1,9 +1,9 @@
 Random.seed!(1234)
 
-function ipopt_optimize(A, b, w, z_hat)
+function ipopt_optimize(A, b, w, z_hat; verbose=false)
     @info "IPOPT"
     model = Model(Ipopt.Optimizer)
-    MOI.set(model, MOI.Silent(), true)
+    MOI.set(model, MOI.Silent(), !verbose)
 
     n = size(A, 1)
 
@@ -11,10 +11,13 @@ function ipopt_optimize(A, b, w, z_hat)
     @variable(model, -1 <= θ[1:n] <= 1)
 
     @objective(model, Min, sum((w[i]*(z[i]-z_hat[i]))^2 for i in 1:n))
-    
+
+    # Note that we assume matrix is symmetric for speed!
     for i=1:n
-        @NLconstraint(model, sum(v * z[j] for (j, v) in zip(findnz(A[i, :])...)) + θ[i]*z[i] == b[i])
+        @NLconstraint(model, sum(v * z[j] for (j, v) in zip(findnz(A[:, i])...)) + θ[i]*z[i] == b[i])
     end
+
+    @info "Finished building model"
 
     optimize!(model)
     @info "Objective value (IPOPT): $(objective_value(model))"
@@ -57,7 +60,7 @@ function greedy_round_robin(A, b, w, z_hat; max_iter=1000)
     return old_obj
 end
 
-function sign_flip_descent(A, b, w, z_hat; max_iter=100, tol=1e-5)
+function sign_flip_descent(A, b, w, z_hat; max_iter=100, tol=1e-5, verbose=false)
     @info "Sign flip descent"
     n = size(A, 1)
 
@@ -75,10 +78,8 @@ function sign_flip_descent(A, b, w, z_hat; max_iter=100, tol=1e-5)
 
         @objective(model, Min, sum((w[i]*(z[i]-z_hat[i]))^2 for i in 1:n))
         
-        for i=1:n
-            @constraint(model, A[i, :]'*z - b[i] <= s_curr[i]*z[i])
-            @constraint(model, A[i, :]'*z - b[i] >= -s_curr[i]*z[i])
-        end
+        @constraint(model, A*z - b .<= s_curr .* z)
+        @constraint(model, A*z - b .>= -s_curr .* z)
 
         optimize!(model)
 
@@ -86,19 +87,23 @@ function sign_flip_descent(A, b, w, z_hat; max_iter=100, tol=1e-5)
 
         s_curr[abs.(z_curr) .<= tol] .*= -1 # Flip all small signs
 
+        if verbose
+            @info "Iteration $curr_iter"
+            @info "Objective value $(objective_value(model))"
+        end
+
         if old_obj - objective_value(model) <= 1e-5
             @info "Objective value (SFD): $(objective_value(model)) at iteration $curr_iter"
             break
         end
 
         old_obj = objective_value(model)
-
     end
 
     return old_obj
 end
 
-function genetic_algorithm(A, b, w, z_hat)
+function genetic_algorithm(A, b, w, z_hat; verbose=false)
     @info "Genetic algorithm"
     A_fac = ldlt(A)
     function obj_fun(θ)
@@ -133,7 +138,8 @@ function genetic_algorithm(A, b, w, z_hat)
             crossoverRate=0.5,
             ɛ=0.1,
             populationSize=250
-        )
+        ),
+        Evolutionary.Options(show_trace=verbose)
     )
 
     @info "Objective value (GA): $(Evolutionary.minimum(result))"
@@ -150,12 +156,14 @@ function global_solver(A, b, w, z_hat)
     @variable(model, y_plus[1:n])
     @variable(model, y_minus[1:n])
     @variable(model, s[1:n], Bin)
+    @variable(model, t_plus[1:n])
+    @variable(model, t_minus[1:n])
 
     z = y_plus + y_minus
     y = y_plus - y_minus
 
     @objective(model, Min, sum(
-            w[i]^2*(quad_over_lin(model, y_plus[i], s[i]) + quad_over_lin(model, y_minus[i], 1-s[i])
+            w[i]^2*(quad_over_lin(model, t_plus[i], y_plus[i], s[i]) + quad_over_lin(model, t_minus[i], y_minus[i], 1-s[i])
             - 2*z[i]*z_hat[i] 
             + z_hat[i]^2) for i in 1:n
         )
